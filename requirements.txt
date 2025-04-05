@@ -1,4 +1,5 @@
-Flask
-requests
-python-dotenv
-werkzeug
+Flask==3.0.2
+flask_cors==4.0.1  # <-- Add this line
+requests==2.31.0
+python-dotenv==1.0.0
+replicate==0.24.0
