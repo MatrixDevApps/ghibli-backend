@@ -1,79 +1,91 @@
-from flask import Flask, request, jsonify
-import requests
 import os
 import time
-import base64
-from werkzeug.utils import secure_filename
+import requests
+import tempfile
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
 from dotenv import load_dotenv
 
 load_dotenv()
 
 app = Flask(__name__)
-
-# Folder to store uploads
-UPLOAD_FOLDER = 'uploads'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+CORS(app)
 
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-REPLICATE_VERSION_ID = "f370727477aa04d12d8c0b5c4e3a22399296c21cd18ff67cd7619710630fe3cb"  # ✅ Your model version ID
 
-@app.route('/')
+@app.route("/")
 def home():
-    return "✅ Ghibli AI Flask Server is running!"
+    return "Ghibli AI Backend is running."
 
-@app.route('/transform', methods=['POST'])
-def transform_image():
-    if 'image' not in request.files:
-        return jsonify({"error": "No image file found"}), 400
+@app.route("/transform", methods=["POST"])
+def transform():
+    if "image" not in request.files:
+        return jsonify({"error": "No image uploaded"}), 400
 
-    image = request.files['image']
-    filename = secure_filename(image.filename)
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    image.save(filepath)
+    image_file = request.files["image"]
+    image_path = os.path.join(tempfile.gettempdir(), image_file.filename)
+    image_file.save(image_path)
 
-    # Read and encode image to base64
-    with open(filepath, "rb") as f:
-        image_data = base64.b64encode(f.read()).decode("utf-8")
+    # Upload image to Replicate's image hosting
+    with open(image_path, "rb") as f:
+        response = requests.post(
+            "https://dreambooth-api-experimental.replicate.com/v1/upload",
+            headers={"Authorization": f"Token {REPLICATE_API_TOKEN}"},
+            files={"file": f}
+        )
 
-    # Step 1: Request prediction
-    headers = {
-        "Authorization": f"Token {REPLICATE_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
+    if response.status_code != 200:
+        return jsonify({"error": "Failed to upload image"}), 500
 
-    data = {
-        "version": REPLICATE_VERSION_ID,
-        "input": {
-            "image": f"data:image/jpeg;base64,{image_data}"
-        }
-    }
+    uploaded_url = response.json()["url"]
 
-    response = requests.post("https://api.replicate.com/v1/predictions", json=data, headers=headers)
+    # Call the model prediction endpoint
+    prediction_response = requests.post(
+        "https://api.replicate.com/v1/predictions",
+        headers={
+            "Authorization": f"Token {REPLICATE_API_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "version": "b14b9bd24838e30f8c7725437ed297907d50d91d9a61b6c07dc2d0c8d8e6bdfb",
+            "input": {
+                "image": uploaded_url,
+                "prompt": "Studio Ghibli style, highly detailed, whimsical scenery",
+                "scheduler": "K_EULER_ANCESTRAL",
+                "num_outputs": 1,
+                "guidance_scale": 3.5
+            }
+        },
+    )
 
-    if response.status_code != 201:
-        print("🟥 Replicate error:", response.text)
-        return jsonify({"error": "Replicate API failed"}), 500
+    if prediction_response.status_code != 201:
+        return jsonify({"error": "Failed to create prediction"}), 500
 
-    prediction = response.json()
+    prediction = prediction_response.json()
     status_url = prediction["urls"]["get"]
 
-    # Step 2: Poll until finished
+    # Poll for completion
     while True:
-        poll = requests.get(status_url, headers=headers)
+        poll = requests.get(status_url, headers={"Authorization": f"Token {REPLICATE_API_TOKEN}"})
         result = poll.json()
 
         if result["status"] == "succeeded":
             output_url = result["output"][0]
-            return jsonify({"output": output_url})
+
+            image_response = requests.get(output_url)
+            if image_response.status_code == 200:
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                temp_file.write(image_response.content)
+                temp_file.close()
+                return send_file(temp_file.name, mimetype='image/jpeg')
+            else:
+                return jsonify({"error": "Failed to download image"}), 500
 
         if result["status"] == "failed":
             return jsonify({"error": "Prediction failed"}), 500
 
         time.sleep(2)
 
-# ✅ Required for Render to bind to 0.0.0.0 and dynamic port
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+if __name__ == "__main__":
+    app.run(debug=True)
 
