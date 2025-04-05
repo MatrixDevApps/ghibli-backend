@@ -23,68 +23,87 @@ def transform():
         return jsonify({"error": "No image uploaded"}), 400
 
     image_file = request.files["image"]
-    image_path = os.path.join(tempfile.gettempdir(), image_file.filename)
-    image_file.save(image_path)
 
-    # Upload image to Replicate's image hosting
-    with open(image_path, "rb") as f:
-        response = requests.post(
-            "https://dreambooth-api-experimental.replicate.com/v1/upload",
-            headers={"Authorization": f"Token {REPLICATE_API_TOKEN}"},
-            files={"file": f}
+    try:
+        image_path = os.path.join(tempfile.gettempdir(), image_file.filename)
+        image_file.save(image_path)
+        print(f"✅ Image saved to: {image_path}")
+    except Exception as e:
+        print(f"❌ Error saving image: {e}")
+        return jsonify({"error": f"Failed to save image: {str(e)}"}), 500
+
+    try:
+        with open(image_path, "rb") as f:
+            response = requests.post(
+                "https://dreambooth-api-experimental.replicate.com/v1/upload",
+                headers={"Authorization": f"Token {REPLICATE_API_TOKEN}"},
+                files={"file": f}
+            )
+        if response.status_code != 200:
+            print(f"❌ Upload failed: {response.text}")
+            return jsonify({"error": "Failed to upload image"}), 500
+
+        uploaded_url = response.json()["url"]
+        print(f"✅ Uploaded URL: {uploaded_url}")
+    except Exception as e:
+        print(f"❌ Error during upload: {e}")
+        return jsonify({"error": f"Upload failed: {str(e)}"}), 500
+
+    try:
+        prediction_response = requests.post(
+            "https://api.replicate.com/v1/predictions",
+            headers={
+                "Authorization": f"Token {REPLICATE_API_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "version": "b14b9bd24838e30f8c7725437ed297907d50d91d9a61b6c07dc2d0c8d8e6bdfb",
+                "input": {
+                    "image": uploaded_url,
+                    "prompt": "Studio Ghibli style, highly detailed, whimsical scenery",
+                    "scheduler": "K_EULER_ANCESTRAL",
+                    "num_outputs": 1,
+                    "guidance_scale": 3.5
+                }
+            },
         )
 
-    if response.status_code != 200:
-        return jsonify({"error": "Failed to upload image"}), 500
+        if prediction_response.status_code != 201:
+            print(f"❌ Prediction creation failed: {prediction_response.text}")
+            return jsonify({"error": "Failed to create prediction"}), 500
 
-    uploaded_url = response.json()["url"]
+        prediction = prediction_response.json()
+        status_url = prediction["urls"]["get"]
+        print("⏳ Polling prediction status...")
 
-    # Call the model prediction endpoint
-    prediction_response = requests.post(
-        "https://api.replicate.com/v1/predictions",
-        headers={
-            "Authorization": f"Token {REPLICATE_API_TOKEN}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "version": "b14b9bd24838e30f8c7725437ed297907d50d91d9a61b6c07dc2d0c8d8e6bdfb",
-            "input": {
-                "image": uploaded_url,
-                "prompt": "Studio Ghibli style, highly detailed, whimsical scenery",
-                "scheduler": "K_EULER_ANCESTRAL",
-                "num_outputs": 1,
-                "guidance_scale": 3.5
-            }
-        },
-    )
+        while True:
+            poll = requests.get(status_url, headers={"Authorization": f"Token {REPLICATE_API_TOKEN}"})
+            result = poll.json()
+            if result["status"] == "succeeded":
+                output_url = result["output"][0]
+                print(f"✅ Prediction succeeded: {output_url}")
 
-    if prediction_response.status_code != 201:
-        return jsonify({"error": "Failed to create prediction"}), 500
+                image_response = requests.get(output_url)
+                if image_response.status_code == 200:
+                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                    temp_file.write(image_response.content)
+                    temp_file.close()
+                    return send_file(temp_file.name, mimetype='image/jpeg')
+                else:
+                    print(f"❌ Image download failed: {image_response.status_code}")
+                    return jsonify({"error": "Failed to download image"}), 500
 
-    prediction = prediction_response.json()
-    status_url = prediction["urls"]["get"]
+            if result["status"] == "failed":
+                print("❌ Prediction failed")
+                return jsonify({"error": "Prediction failed"}), 500
 
-    # Poll for completion
-    while True:
-        poll = requests.get(status_url, headers={"Authorization": f"Token {REPLICATE_API_TOKEN}"})
-        result = poll.json()
+            time.sleep(2)
 
-        if result["status"] == "succeeded":
-            output_url = result["output"][0]
+    except Exception as e:
+        print(f"❌ Error in prediction or polling: {e}")
+        return jsonify({"error": f"Prediction error: {str(e)}"}), 500
 
-            image_response = requests.get(output_url)
-            if image_response.status_code == 200:
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-                temp_file.write(image_response.content)
-                temp_file.close()
-                return send_file(temp_file.name, mimetype='image/jpeg')
-            else:
-                return jsonify({"error": "Failed to download image"}), 500
-
-        if result["status"] == "failed":
-            return jsonify({"error": "Prediction failed"}), 500
-
-        time.sleep(2)
+# ✅ Ensure correct port binding for Render
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
